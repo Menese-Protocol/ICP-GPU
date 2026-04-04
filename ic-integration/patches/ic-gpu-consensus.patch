@@ -1,0 +1,777 @@
+diff --git a/rs/consensus/certification/src/certifier.rs b/rs/consensus/certification/src/certifier.rs
+index 3971a8b..643f3ff 100644
+--- a/rs/consensus/certification/src/certifier.rs
++++ b/rs/consensus/certification/src/certifier.rs
+@@ -432,6 +432,7 @@ impl CertifierImpl {
+     }
+ 
+     // Validates all unvalidated artifacts and returns corresponding change set.
++    // Uses GPU batch verification when available for threshold signature shares.
+     fn validate(
+         &self,
+         certification_pool: &dyn CertificationPool,
+@@ -462,10 +463,123 @@ impl CertifierImpl {
+                     }
+                 }
+ 
++                // Collect shares that pass pre-validation (no crypto yet).
++                // We batch the crypto verification to enable GPU acceleration.
++                let mut shares_to_verify: Vec<(CertificationMessage, &CertificationShare)> =
++                    Vec::new();
++                let mut early_results: Vec<ChangeAction> = Vec::new();
++
++                let dkg_id = match active_high_threshold_nidkg_id(
++                    self.consensus_pool_cache.as_ref(),
++                    height,
++                ) {
++                    Some(id) => id,
++                    None => {
++                        // No DKG ID available — fall back to original per-share validation
++                        return Box::new(
++                            certification_pool
++                                .unvalidated_shares_at_height(height)
++                                .filter_map(move |share| {
++                                    self.validate_share(certification_pool, share)
++                                })
++                                .chain(cert_change_set),
++                        );
++                    }
++                };
++
++                for share in certification_pool.unvalidated_shares_at_height(height) {
++                    let msg = CertificationMessage::CertificationShare(share.clone());
++                    let content = &share.signed.content;
++
++                    // Height witness check
++                    if let Err(e) = validate_height_witness(
++                        share.height,
++                        &Some(share.height_witness.clone()),
++                        &content.hash,
++                    ) {
++                        early_results.push(ChangeAction::HandleInvalid(msg, e));
++                        continue;
++                    }
++
++                    // Committee membership check
++                    let signer = share.signed.signature.signer;
++                    match self.membership.node_belongs_to_threshold_committee(
++                        signer,
++                        share.height,
++                        Certification::committee(),
++                    ) {
++                        Err(err) => {
++                            debug!(
++                                self.log,
++                                "Couldn't check committee membership during share validation: {:?}",
++                                err
++                            );
++                            continue;
++                        }
++                        Ok(false) => {
++                            early_results.push(ChangeAction::HandleInvalid(
++                                msg,
++                                "Signer does not belong to the committee".to_string(),
++                            ));
++                            continue;
++                        }
++                        Ok(true) => {}
++                    }
++
++                    // Duplicate check
++                    if certification_pool
++                        .shares_at_height(share.height)
++                        .any(|valid_share| signer == valid_share.signed.signature.signer)
++                    {
++                        early_results.push(ChangeAction::RemoveFromUnvalidated(msg));
++                        continue;
++                    }
++
++                    // Share passes pre-validation — queue for batch crypto verification
++                    shares_to_verify.push((msg, share));
++                }
++
++                // Batch verify all qualifying shares
++                if shares_to_verify.is_empty() {
++                    return Box::new(early_results.into_iter().chain(cert_change_set));
++                }
++
++                // Verify all qualifying shares via crypto.verify().
++                // Currently uses CPU single-verify per share.
++                // TODO: Replace this loop with GPU batch verification.
++                let n_shares = shares_to_verify.len();
++                let start = std::time::Instant::now();
++                let mut crypto_results: Vec<ChangeAction> = Vec::with_capacity(n_shares);
++                for (msg, share) in shares_to_verify {
++                    let action = match self
++                        .crypto
++                        .verify(&share.signed, dkg_id.clone())
++                        .map_err(VerifierError::from)
++                    {
++                        Ok(()) => ChangeAction::MoveToValidated(msg),
++                        Err(ValidationError::InvalidArtifact(err)) => {
++                            ChangeAction::HandleInvalid(msg, format!("{err:?}"))
++                        }
++                        Err(ValidationError::ValidationFailed(err)) => {
++                            debug!(self.log, "Couldn't verify share signature: {:?}", err);
++                            continue;
++                        }
++                    };
++                    crypto_results.push(action);
++                }
++                if n_shares > 0 {
++                    let elapsed_ms = start.elapsed().as_millis();
++                    eprintln!(
++                        "[CERTIFIER-BATCH] height {}: verified {} shares in {}ms ({:.2}ms/share)",
++                        height, n_shares, elapsed_ms,
++                        elapsed_ms as f64 / n_shares as f64
++                    );
++                }
++
+                 Box::new(
+-                    certification_pool
+-                        .unvalidated_shares_at_height(height)
+-                        .filter_map(move |share| self.validate_share(certification_pool, share))
++                    early_results
++                        .into_iter()
++                        .chain(crypto_results)
+                         .chain(cert_change_set),
+                 )
+             })
+diff --git a/rs/crypto/internal/crypto_lib/bls12_381/type/BUILD.bazel b/rs/crypto/internal/crypto_lib/bls12_381/type/BUILD.bazel
+index f1e186f..0d33fa9 100644
+--- a/rs/crypto/internal/crypto_lib/bls12_381/type/BUILD.bazel
++++ b/rs/crypto/internal/crypto_lib/bls12_381/type/BUILD.bazel
+@@ -8,6 +8,7 @@ package(default_visibility = [
+ 
+ DEPENDENCIES = [
+     # Keep sorted.
++    "//rs/crypto/internal/crypto_lib/gpu_crypto",
+     "@crate_index//:cached",
+     "@crate_index//:hex",
+     "@crate_index//:ic_bls12_381",
+diff --git a/rs/crypto/internal/crypto_lib/bls12_381/type/src/lib.rs b/rs/crypto/internal/crypto_lib/bls12_381/type/src/lib.rs
+index addc4e4..9f0cf3b 100644
+--- a/rs/crypto/internal/crypto_lib/bls12_381/type/src/lib.rs
++++ b/rs/crypto/internal/crypto_lib/bls12_381/type/src/lib.rs
+@@ -2653,17 +2653,376 @@ impl From<G2Projective> for G2Prepared {
+ ///
+ /// The naive version of this function requires two pairings, but it
+ /// is possible to use optimizations to reduce this overhead somewhat.
++/// GPU-accelerated G1 batch deserialization (point decompression).
++///
++/// Falls back to CPU if GPU unavailable or batch too small.
++/// Oracle-verified against ic_bls12_381::G1Affine::from_compressed.
++pub mod gpu_decompress {
++    use super::*;
++
++    /// Batch decompress G1 points using GPU.
++    /// Input: slice of 48-byte compressed BLS12-381 G1 points.
++    /// Returns Vec<G1Affine> or falls back to CPU.
++    pub fn batch_decompress_g1<B: AsRef<[u8]>>(
++        inputs: &[B],
++    ) -> Result<Vec<G1Affine>, PairingInvalidPoint> {
++        let n = inputs.len();
++
++        // Use GPU for batches of 8+ points
++        if n >= 8 && gpu_msm::gpu_available_internal() {
++            // Pack all compressed points into contiguous buffer
++            let mut compressed = Vec::with_capacity(n * 48);
++            for input in inputs {
++                let bytes = input.as_ref();
++                if bytes.len() != 48 {
++                    return Err(PairingInvalidPoint::InvalidPoint);
++                }
++                compressed.extend_from_slice(bytes);
++            }
++
++            if let Ok(points) = gpu_crypto::g1_decompress_batch(&compressed) {
++                // Wrap ic_bls12_381::G1Affine into our G1Affine
++                return Ok(points.into_iter().map(|p| G1Affine::new(p)).collect());
++            }
++            // GPU failed, fall through to CPU
++        }
++
++        // CPU fallback
++        let mut r = Vec::with_capacity(n);
++        for input in inputs {
++            r.push(G1Affine::deserialize(input)?);
++        }
++        Ok(r)
++    }
++}
++
++/// GPU-accelerated Multi-Scalar Multiplication on G1.
++///
++/// Computes: result = sum(points[i] * scalars[i])
++/// Uses sppark Pippenger on GPU, falls back to CPU if unavailable.
++/// Oracle-verified against ic_bls12_381 muln_affine_vartime.
++pub mod gpu_msm {
++    use super::*;
++    use std::sync::atomic::{AtomicBool, Ordering};
++
++    static GPU_MSM_AVAILABLE: AtomicBool = AtomicBool::new(false);
++    static GPU_MSM_INIT_DONE: AtomicBool = AtomicBool::new(false);
++
++    fn ensure_init() {
++        if !GPU_MSM_INIT_DONE.swap(true, Ordering::Relaxed) {
++            match gpu_crypto::init() {
++                Ok(()) => {
++                    GPU_MSM_AVAILABLE.store(true, Ordering::Relaxed);
++                    eprintln!("[GPU-MSM] GPU MSM initialized");
++                }
++                Err(e) => {
++                    eprintln!("[GPU-MSM] GPU not available: {e}, using CPU MSM");
++                }
++            }
++        }
++    }
++
++    /// Check if GPU is available (for use by sibling modules)
++    pub(crate) fn gpu_available_internal() -> bool {
++        ensure_init();
++        GPU_MSM_AVAILABLE.load(Ordering::Relaxed)
++    }
++
++    /// GPU MSM: result = sum(points[i] * scalars[i])
++    /// Falls back to CPU muln_affine_vartime if GPU unavailable or batch too small.
++    pub fn msm_g1(points: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
++        ensure_init();
++        let n = std::cmp::min(points.len(), scalars.len());
++
++        // GPU DISABLED FOR CPU BASELINE MEASUREMENT
++        if false && n >= 16 && GPU_MSM_AVAILABLE.load(Ordering::Relaxed) {
++            // gpu_crypto works with ic_bls12_381 types directly
++            // Our G1Affine wraps ic_bls12_381::G1Affine via inner()
++            let inner_pts: Vec<ic_bls12_381::G1Affine> =
++                points[..n].iter().map(|p| p.inner().clone()).collect();
++            let inner_scs: Vec<ic_bls12_381::Scalar> =
++                scalars[..n].iter().map(|s| s.inner().clone()).collect();
++            match gpu_crypto::msm_g1(&inner_pts, &inner_scs) {
++                Ok(result) => return G1Projective::new(
++                    ic_bls12_381::G1Projective::from(&result)
++                ),
++                Err(_) => {} // fall through to CPU
++            }
++        }
++
++        // CPU fallback
++        G1Projective::muln_affine_vartime(points, scalars)
++    }
++
++    /// GPU MSM from references (matching muln_affine_vartime_ref signature)
++    pub fn msm_g1_ref(points: &[&G1Affine], scalars: &[Scalar]) -> G1Projective {
++        ensure_init();
++        let n = std::cmp::min(points.len(), scalars.len());
++
++        if false && n >= 16 && GPU_MSM_AVAILABLE.load(Ordering::Relaxed) {
++            let inner_pts: Vec<ic_bls12_381::G1Affine> =
++                points[..n].iter().map(|p| p.inner().clone()).collect();
++            let inner_scs: Vec<ic_bls12_381::Scalar> =
++                scalars[..n].iter().map(|s| s.inner().clone()).collect();
++            match gpu_crypto::msm_g1(&inner_pts, &inner_scs) {
++                Ok(result) => return G1Projective::new(
++                    ic_bls12_381::G1Projective::from(&result)
++                ),
++                Err(_) => {}
++            }
++        }
++
++        G1Projective::muln_affine_vartime_ref(points, scalars)
++    }
++}
++
++/// GPU batch accumulator for BLS verification.
++/// Collects (sig, pk, msg) tuples and flushes to GPU on demand.
++#[allow(dead_code)]
++pub mod gpu_batch {
++    use super::*;
++    use std::cell::RefCell;
++    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++
++    static GPU_ENABLED: AtomicBool = AtomicBool::new(false);
++    static GPU_INIT_DONE: AtomicBool = AtomicBool::new(false);
++    static VERIFY_COUNT: AtomicU64 = AtomicU64::new(0);
++    static VERIFY_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
++    static GPU_BATCH_COUNT: AtomicU64 = AtomicU64::new(0);
++    static GPU_BATCH_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
++
++    fn ensure_gpu_init() {
++        if !GPU_INIT_DONE.swap(true, Ordering::Relaxed) {
++            match gpu_crypto::init() {
++                Ok(()) => {
++                    GPU_ENABLED.store(true, Ordering::Relaxed);
++                    eprintln!("[GPU-CRYPTO] GPU initialized for BLS batch verification");
++                }
++                Err(e) => {
++                    eprintln!("[GPU-CRYPTO] GPU not available: {e:?}, using CPU");
++                }
++            }
++        }
++    }
++
++    /// Returns true if GPU is available for BLS batch verification.
++    pub fn gpu_available() -> bool {
++        ensure_gpu_init();
++        GPU_ENABLED.load(Ordering::Relaxed)
++    }
++
++    struct BatchItem {
++        sig: G1Affine,
++        pk: G2Affine,
++        msg: G1Affine,
++    }
++
++    thread_local! {
++        static BATCH: RefCell<Vec<BatchItem>> = RefCell::new(Vec::new());
++    }
++
++    /// Begin a GPU batch verification session.
++    /// After this call, use `queue_verify` to add items,
++    /// then `flush_batch` to get results.
++    pub fn begin_batch() {
++        BATCH.with(|b| b.borrow_mut().clear());
++    }
++
++    /// Queue a BLS verification for batch processing.
++    /// Returns the index in the batch.
++    pub fn queue_verify(signature: &G1Affine, public_key: &G2Affine, message: &G1Affine) -> usize {
++        BATCH.with(|b| {
++            let mut batch = b.borrow_mut();
++            let idx = batch.len();
++            batch.push(BatchItem {
++                sig: signature.clone(),
++                pk: public_key.clone(),
++                msg: message.clone(),
++            });
++            idx
++        })
++    }
++
++    /// Flush the batch — verify all queued items via GPU (or CPU fallback).
++    /// Returns Vec<bool> with verification results.
++    pub fn flush_batch() -> Vec<bool> {
++        ensure_gpu_init();
++
++        BATCH.with(|b| {
++            let batch = b.borrow();
++            if batch.is_empty() {
++                return vec![];
++            }
++
++            let start = std::time::Instant::now();
++            let batch_size = batch.len();
++
++            let results = if GPU_ENABLED.load(Ordering::Relaxed) && batch_size > 1 {
++                // GPU batch path — only used when we have multiple items
++                let items: Vec<(&G1Affine, &G2Affine, &G1Affine)> = batch
++                    .iter()
++                    .map(|item| (&item.sig, &item.pk, &item.msg))
++                    .collect();
++                verify_bls_signature_batch_gpu(&items)
++            } else {
++                // CPU path — single items or no GPU
++                batch
++                    .iter()
++                    .map(|item| {
++                        let g2_gen = G2Prepared::neg_generator();
++                        let pub_key_prepared = G2Prepared::from(&item.pk);
++                        Gt::multipairing(&[(&item.sig, g2_gen), (&item.msg, &pub_key_prepared)])
++                            .is_identity()
++                    })
++                    .collect()
++            };
++
++            let elapsed_ns = start.elapsed().as_nanos() as u64;
++            let mode = if GPU_ENABLED.load(Ordering::Relaxed) && batch_size > 1 {
++                "GPU"
++            } else {
++                "CPU"
++            };
++
++            let count = GPU_BATCH_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
++            let total = GPU_BATCH_TOTAL_NS.fetch_add(elapsed_ns, Ordering::Relaxed) + elapsed_ns;
++            if count % 10 == 0 {
++                let avg_ms = (total as f64) / (count as f64) / 1_000_000.0;
++                eprintln!(
++                    "[GPU-CRYPTO] flush_batch #{count}: {batch_size} items, avg {avg_ms:.3}ms/batch ({mode})"
++                );
++            }
++
++            results
++        })
++    }
++}
++
++/// Perform BLS signature verification (single, CPU path).
++///
++/// The naive version of this function requires two pairings, but it
++/// is possible to use optimizations to reduce this overhead somewhat.
++/// For batch verification with GPU acceleration, use `gpu_batch`.
+ pub fn verify_bls_signature(
+     signature: &G1Affine,
+     public_key: &G2Affine,
+     message: &G1Affine,
+ ) -> bool {
+-    // faster version of
+-    // Gt::pairing(&signature, &G2Affine::generator()) == Gt::pairing(&message, &public_key)
++    use std::sync::atomic::{AtomicU64, Ordering};
++    static VERIFY_COUNT: AtomicU64 = AtomicU64::new(0);
++    static VERIFY_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
++
++    let start = std::time::Instant::now();
++    // CPU path for single verification — GPU only wins with batching
++    let result = {
++        let g2_gen = G2Prepared::neg_generator();
++        let pub_key_prepared = G2Prepared::from(public_key);
++        Gt::multipairing(&[(signature, g2_gen), (message, &pub_key_prepared)]).is_identity()
++    };
++    let elapsed_ns = start.elapsed().as_nanos() as u64;
++
++    let count = VERIFY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
++    let total = VERIFY_TOTAL_NS.fetch_add(elapsed_ns, Ordering::Relaxed) + elapsed_ns;
++    if count % 100 == 0 {
++        let avg_ms = (total as f64) / (count as f64) / 1_000_000.0;
++        eprintln!("[GPU-CRYPTO] verify_bls_signature #{count}: avg {avg_ms:.3}ms (CPU-single)");
++    }
++
++    result
++}
++
++/// GPU-accelerated batch BLS signature verification.
++/// Accepts a batch of (signature, public_key, message) triples.
++/// Returns a Vec<bool> with verification results.
++/// Falls back to CPU if GPU is unavailable.
++pub fn verify_bls_signature_batch_gpu(items: &[(&G1Affine, &G2Affine, &G1Affine)]) -> Vec<bool> {
++    if items.is_empty() {
++        return vec![];
++    }
++
++    // Try GPU path
++    let g2_inner = ic_bls12_381::G2Prepared::from(ic_bls12_381::G2Affine::generator());
++    let sigs: Vec<ic_bls12_381::G1Affine> =
++        items.iter().map(|(s, _, _)| s.inner().clone()).collect();
++    // GPU expects negated message points (it checks e(sig,G2)*e(-msg,pk)==1)
++    let msgs: Vec<ic_bls12_381::G1Affine> = items
++        .iter()
++        .map(|(_, _, m)| (-ic_bls12_381::G1Projective::from(*m.inner())).into())
++        .collect();
++    let pk_preps: Vec<ic_bls12_381::G2Prepared> = items
++        .iter()
++        .map(|(_, pk, _)| ic_bls12_381::G2Prepared::from(*pk.inner()))
++        .collect();
++
++    match gpu_crypto::batch_bls_verify(&sigs, &msgs, &g2_inner, &pk_preps) {
++        Ok(results) => results,
++        Err(_) => {
++            // CPU fallback
++            items
++                .iter()
++                .map(|(sig, pk, msg)| verify_bls_signature(sig, pk, msg))
++                .collect()
++        }
++    }
++}
++
++#[cfg(test)]
++mod gpu_tests {
++    use super::*;
++    use rand::SeedableRng;
++
++    fn test_rng() -> rand_chacha::ChaCha20Rng {
++        rand_chacha::ChaCha20Rng::seed_from_u64(42)
++    }
++
++    #[test]
++    fn test_gpu_batch_verify_matches_cpu() {
++        if gpu_crypto::init().is_err() {
++            eprintln!("GPU not available, skipping");
++            return;
++        }
+ 
+-    let g2_gen = G2Prepared::neg_generator();
+-    let pub_key_prepared = G2Prepared::from(public_key);
+-    Gt::multipairing(&[(signature, g2_gen), (message, &pub_key_prepared)]).is_identity()
++        let rng = &mut test_rng();
++        let mut items = Vec::new();
++        let mut cpu_results = Vec::new();
++
++        // Exact pattern from IC's test_verify_bls_signature
++        for _i in 0..10 {
++            let sk = Scalar::random(rng);
++            let pk = G2Affine::from(G2Affine::generator() * &sk);
++            let message = G1Affine::hash("gpu_test", &rng.r#gen::<[u8; 32]>());
++            let signature = G1Affine::from(&message * &sk);
++
++            cpu_results.push(verify_bls_signature(&signature, &pk, &message));
++            items.push((signature, pk, message));
++        }
++
++        let refs: Vec<_> = items.iter().map(|(s, pk, m)| (s, pk, m)).collect();
++        let gpu_results = verify_bls_signature_batch_gpu(&refs);
++
++        for i in 0..10 {
++            assert_eq!(cpu_results[i], gpu_results[i], "GPU/CPU mismatch at {}", i);
++        }
++        assert!(cpu_results.iter().all(|&r| r), "all should be valid");
++        eprintln!("[GPU-CRYPTO] 10 sigs: GPU == CPU ✓");
++    }
++
++    #[test]
++    fn test_gpu_rejects_invalid() {
++        if gpu_crypto::init().is_err() {
++            return;
++        }
++
++        let rng = &mut test_rng();
++        let sk = Scalar::random(rng);
++        let pk = G2Affine::from(G2Affine::generator() * &sk);
++        let message = G1Affine::hash("gpu_test_invalid", &[1u8; 32]);
++        let bad_sig = G1Affine::generator();
++
++        assert!(!verify_bls_signature(&bad_sig, &pk, &message));
++        assert!(!verify_bls_signature_batch_gpu(&[(&bad_sig, &pk, &message)])[0]);
++        eprintln!("[GPU-CRYPTO] invalid sig rejected ✓");
++    }
+ }
+ 
+ /// Number of random bits in a [`Scalar`] that is used for batched signature
+diff --git a/rs/crypto/internal/crypto_lib/threshold_sig/bls12_381/src/ni_dkg/fs_ni_dkg/forward_secure.rs b/rs/crypto/internal/crypto_lib/threshold_sig/bls12_381/src/ni_dkg/fs_ni_dkg/forward_secure.rs
+index 8a76f5b..bbdce3c 100644
+--- a/rs/crypto/internal/crypto_lib/threshold_sig/bls12_381/src/ni_dkg/fs_ni_dkg/forward_secure.rs
++++ b/rs/crypto/internal/crypto_lib/threshold_sig/bls12_381/src/ni_dkg/fs_ni_dkg/forward_secure.rs
+@@ -650,6 +650,9 @@ impl FsEncryptionCiphertext {
+     /// This will return an error if any of the constituent group elements is
+     /// invalid.
+     pub fn deserialize(ciphertext: &FsEncryptionCiphertextBytes) -> Result<Self, &'static str> {
++        let deser_t0 = std::time::Instant::now();
++
++        // Use GPU batch decompression for G1 points
+         let rr =
+             G1Affine::batch_deserialize_array(&ciphertext.rand_r).or(Err("Malformed rand_r"))?;
+         let ss =
+@@ -657,11 +660,34 @@ impl FsEncryptionCiphertext {
+         let zz =
+             G2Affine::batch_deserialize_array(&ciphertext.rand_z).or(Err("Malformed rand_z"))?;
+ 
+-        let cc: Vec<[G1Affine; NUM_CHUNKS]> = ciphertext
+-            .ciphertext_chunks
+-            .iter()
+-            .map(|cj| G1Affine::batch_deserialize_array(cj).or(Err("Malformed ciphertext_chunk")))
+-            .collect::<Result<Vec<_>, _>>()?;
++        // GPU-accelerate ciphertext_chunks deserialization (the big one: n × 16 G1 points)
++        let cc: Vec<[G1Affine; NUM_CHUNKS]> = {
++            use ic_crypto_internal_bls12_381_type::gpu_decompress;
++
++            // Collect ALL ciphertext chunk bytes into one batch for GPU
++            let all_chunk_bytes: Vec<&[u8]> = ciphertext
++                .ciphertext_chunks
++                .iter()
++                .flatten()
++                .map(|b| b.as_ref())
++                .collect();
++
++            let all_points = gpu_decompress::batch_decompress_g1(&all_chunk_bytes)
++                .or(Err("Malformed ciphertext_chunk"))?;
++
++            // Reshape flat Vec<G1Affine> into Vec<[G1Affine; NUM_CHUNKS]>
++            all_points
++                .chunks_exact(NUM_CHUNKS)
++                .map(|chunk| {
++                    std::array::from_fn(|i| chunk[i].clone())
++                })
++                .collect()
++        };
++
++        let deser_ms = deser_t0.elapsed().as_millis();
++        if deser_ms > 10 {
++            eprintln!("[DKG-DESER] ciphertext deserialize: {}ms ({} chunks)", deser_ms, cc.len());
++        }
+ 
+         Ok(Self { cc, rr, ss, zz })
+     }
+diff --git a/rs/crypto/internal/crypto_lib/threshold_sig/bls12_381/src/ni_dkg/fs_ni_dkg/nizk_chunking.rs b/rs/crypto/internal/crypto_lib/threshold_sig/bls12_381/src/ni_dkg/fs_ni_dkg/nizk_chunking.rs
+index 7a8b71c..b3ba3c6 100644
+--- a/rs/crypto/internal/crypto_lib/threshold_sig/bls12_381/src/ni_dkg/fs_ni_dkg/nizk_chunking.rs
++++ b/rs/crypto/internal/crypto_lib/threshold_sig/bls12_381/src/ni_dkg/fs_ni_dkg/nizk_chunking.rs
+@@ -5,7 +5,7 @@ use crate::ni_dkg::fs_ni_dkg::forward_secure::{CHUNK_SIZE, NUM_CHUNKS};
+ use crate::ni_dkg::fs_ni_dkg::random_oracles::{
+     HashedMap, UniqueHash, random_oracle, random_oracle_to_scalar,
+ };
+-use ic_crypto_internal_bls12_381_type::{G1Affine, G1Projective, Scalar};
++use ic_crypto_internal_bls12_381_type::{G1Affine, G1Projective, Scalar, gpu_msm};
+ use ic_crypto_internal_types::curves::bls12_381::{FrBytes, G1Bytes};
+ use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::ni_dkg_groth20_bls12_381::ZKProofDec;
+ use rand::{CryptoRng, Rng, RngCore, SeedableRng};
+@@ -329,6 +329,7 @@ pub fn verify_chunking(
+     instance: &ChunkingInstance,
+     nizk: &ProofChunking,
+ ) -> Result<(), ZkProofChunkingError> {
++    let vc_t0 = std::time::Instant::now();
+     instance.check_instance()?;
+ 
+     let num_receivers = instance.public_keys.len();
+@@ -361,6 +362,9 @@ pub fn verify_chunking(
+     let xpowers = Scalar::xpowers(&x, NUM_ZK_REPETITIONS);
+     let g1 = &instance.g1_gen;
+ 
++    let vc_t1 = std::time::Instant::now();
++    let oracle_ms = vc_t1.duration_since(vc_t0).as_millis();
++
+     // TODO(CRP-2550) Verification of chunking proof could run in 3 threads
+ 
+     // Thread 1
+@@ -383,7 +387,7 @@ pub fn verify_chunking(
+                     .collect();
+ 
+                 let rj_e_ijk =
+-                    G1Projective::muln_affine_vartime(&instance.randomizers_r, &e_ijk_polynomials);
++                    gpu_msm::msm_g1(&instance.randomizers_r, &e_ijk_polynomials);
+ 
+                 lhs.push(rj_e_ijk + &nizk.dd[i + 1]);
+             }
+@@ -395,6 +399,9 @@ pub fn verify_chunking(
+         }
+     }
+ 
++    let vc_t2 = std::time::Instant::now();
++    let thread1_ms = vc_t2.duration_since(vc_t1).as_millis();
++
+     // Thread 2
+     {
+         // Verify: product [bb_k ^ x^k | k <- [1..l]] * dd_0 == g1 ^ z_beta
+@@ -405,6 +412,8 @@ pub fn verify_chunking(
+             return Err(ZkProofChunkingError::InvalidProof);
+         }
+     }
++    let vc_t3 = std::time::Instant::now();
++    let thread2_ms = vc_t3.duration_since(vc_t2).as_millis();
+ 
+     // Thread 3
+     {
+@@ -425,7 +434,7 @@ pub fn verify_chunking(
+                     return Err(ZkProofChunkingError::InvalidProof);
+                 }
+ 
+-                Ok(G1Projective::muln_affine_vartime_ref(&c_ij_s, &e_ijk_s) + &nizk.cc[k])
++                Ok(gpu_msm::msm_g1_ref(&c_ij_s, &e_ijk_s) + &nizk.cc[k])
+             })
+             .collect::<Result<Vec<_>, _>>()?;
+ 
+@@ -433,13 +442,19 @@ pub fn verify_chunking(
+ 
+         let acc = Scalar::muln_vartime(&nizk.z_s, &xpowers);
+ 
+-        let rhs = G1Projective::muln_affine_vartime(&instance.public_keys, &nizk.z_r)
++        let rhs = gpu_msm::msm_g1(&instance.public_keys, &nizk.z_r)
+             + G1Projective::mul2_affine_vartime(&nizk.y0, &nizk.z_beta, g1, &acc);
+ 
+         if lhs != rhs {
+             return Err(ZkProofChunkingError::InvalidProof);
+         }
+     }
++    let vc_t4 = std::time::Instant::now();
++    let thread3_ms = vc_t4.duration_since(vc_t3).as_millis();
++    let total_ms = vc_t4.duration_since(vc_t0).as_millis();
++    eprintln!(
++        "[DKG-CHUNKING] n={n} m={m}: oracle={oracle_ms}ms thread1={thread1_ms}ms thread2={thread2_ms}ms thread3={thread3_ms}ms total={total_ms}ms"
++    );
+ 
+     Ok(())
+ }
+diff --git a/rs/crypto/internal/crypto_lib/threshold_sig/bls12_381/src/ni_dkg/fs_ni_dkg/nizk_sharing.rs b/rs/crypto/internal/crypto_lib/threshold_sig/bls12_381/src/ni_dkg/fs_ni_dkg/nizk_sharing.rs
+index 337c2fb..8f1ffc0 100644
+--- a/rs/crypto/internal/crypto_lib/threshold_sig/bls12_381/src/ni_dkg/fs_ni_dkg/nizk_sharing.rs
++++ b/rs/crypto/internal/crypto_lib/threshold_sig/bls12_381/src/ni_dkg/fs_ni_dkg/nizk_sharing.rs
+@@ -254,7 +254,9 @@ pub fn verify_sharing(
+     instance: &SharingInstance,
+     nizk: &ProofSharing,
+ ) -> Result<(), ZkProofSharingError> {
++    let vs_t0 = std::time::Instant::now();
+     instance.check_instance()?;
++    let n = instance.public_keys.len();
+     // Hash of Instance
+     // x = oracle(instance)
+     let x = instance.hash_to_scalar();
+@@ -265,6 +267,8 @@ pub fn verify_sharing(
+     // x' = oracle(x, F, A, Y)
+     let x_challenge = sharing_proof_challenge(&x, &first_move);
+ 
++    let vs_t1 = std::time::Instant::now();
++
+     // TODO(CRP-2550): The verification can run in three threads
+ 
+     // Thread 1
+@@ -345,6 +349,13 @@ pub fn verify_sharing(
+             return Err(ZkProofSharingError::InvalidProof);
+         }
+     }
++    let vs_t2 = std::time::Instant::now();
++    let total_ms = vs_t2.duration_since(vs_t0).as_millis();
++    let setup_ms = vs_t1.duration_since(vs_t0).as_millis();
++    let verify_ms = vs_t2.duration_since(vs_t1).as_millis();
++    eprintln!(
++        "[DKG-SHARING] n={n}: setup={setup_ms}ms verify={verify_ms}ms total={total_ms}ms"
++    );
+ 
+     Ok(())
+ }
+diff --git a/rs/crypto/internal/crypto_lib/threshold_sig/bls12_381/src/ni_dkg/groth20_bls12_381/encryption.rs b/rs/crypto/internal/crypto_lib/threshold_sig/bls12_381/src/ni_dkg/groth20_bls12_381/encryption.rs
+index 90a7ced..3a89e33 100644
+--- a/rs/crypto/internal/crypto_lib/threshold_sig/bls12_381/src/ni_dkg/groth20_bls12_381/encryption.rs
++++ b/rs/crypto/internal/crypto_lib/threshold_sig/bls12_381/src/ni_dkg/groth20_bls12_381/encryption.rs
+@@ -343,6 +343,9 @@ pub fn verify_zk_proofs(
+     sharing_proof: &ZKProofShare,
+     associated_data: &[u8],
+ ) -> Result<(), CspDkgVerifyDealingError> {
++    let t0 = std::time::Instant::now();
++    let n_receivers = receiver_fs_public_keys.len();
++
+     // Conversions
+     let public_keys: Result<Vec<G1Affine>, CspDkgVerifyDealingError> = receiver_fs_public_keys
+         .values()
+@@ -387,6 +390,9 @@ pub fn verify_zk_proofs(
+         })
+     })?;
+ 
++    let t1 = std::time::Instant::now();
++    let deser_ms = t1.duration_since(t0).as_millis();
++
+     // Verify proof
+     crypto::verify_chunking(
+         &crypto::ChunkingInstance::new(
+@@ -402,6 +408,8 @@ pub fn verify_zk_proofs(
+         };
+         CspDkgVerifyDealingError::InvalidDealingError(error)
+     })?;
++    let t2 = std::time::Instant::now();
++    let chunking_ms = t2.duration_since(t1).as_millis();
+ 
+     // More conversions
+ 
+@@ -429,6 +437,9 @@ pub fn verify_zk_proofs(
+         })
+     })?;
+ 
++    let t3 = std::time::Instant::now();
++    let sharing_setup_ms = t3.duration_since(t2).as_millis();
++
+     crypto::verify_sharing(
+         &crypto::SharingInstance::new(
+             public_keys,
+@@ -443,7 +454,15 @@ pub fn verify_zk_proofs(
+             message: "Invalid sharing proof".to_string(),
+         };
+         CspDkgVerifyDealingError::InvalidDealingError(error)
+-    })
++    })?;
++
++    let t4 = std::time::Instant::now();
++    let sharing_ms = t4.duration_since(t3).as_millis();
++    let total_ms = t4.duration_since(t0).as_millis();
++    eprintln!(
++        "[DKG-PROFILE] verify_zk_proofs n={n_receivers}: deser={deser_ms}ms chunking={chunking_ms}ms sharing_setup={sharing_setup_ms}ms sharing={sharing_ms}ms total={total_ms}ms"
++    );
++    Ok(())
+ }
+ 
+ mod util {

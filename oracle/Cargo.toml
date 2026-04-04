@@ -1,0 +1,17 @@
+[package]
+name = "gpu-oracle"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "oracle"
+path = "src/main.rs"
+
+[dependencies]
+ic_bls12_381 = "0.10.1"
+ff = "0.13"
+group = "0.13"
+rand = "0.8"
+rand_chacha = "0.3"
+hex = "0.4"
+sha2 = "0.10"

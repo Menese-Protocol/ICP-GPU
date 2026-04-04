@@ -1,0 +1,81 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = [
+    "//rs/crypto:__subpackages__",
+])
+
+# Compile CUDA → static library (pairing/SHA) + shared library (MSM)
+genrule(
+    name = "compile_cuda",
+    srcs = glob(["cuda/**"]),
+    outs = [
+        "libgpu_crypto_cuda.a",
+        "libcudart_copy.a",
+        "libgpu_msm.so",
+    ],
+    cmd = """
+        NVCC=$$(which nvcc 2>/dev/null || echo /usr/local/cuda/bin/nvcc)
+        CUDA_PATH=$$(dirname $$(dirname $$NVCC))
+        if [ -f "$$NVCC" ]; then
+            ARCH=$$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.' | sed 's/^/sm_/' || echo "sm_80")
+            SRCDIR=$$(dirname $$(echo $(SRCS) | tr ' ' '\\n' | grep 'api\\.cu$$'))
+            # 1) BLS verify + SHA256 (pure C, no C++ deps)
+            $$NVCC -c $$SRCDIR/api.cu -o /tmp/gpu_api_$$$$.o \
+                -arch=$$ARCH -O2 -DGPU_CRYPTO_DEVICE_ONLY \
+                -I$$SRCDIR -I$$SRCDIR/vendor/sppark -I$$SRCDIR/vendor/blst
+            ar rcs $(location libgpu_crypto_cuda.a) /tmp/gpu_api_$$$$.o
+            # 2) MSM + Decompression shared library (needs C++ runtime)
+            $$NVCC -shared -o $(location libgpu_msm.so) \
+                $$SRCDIR/msm.cu $$SRCDIR/decompress.cu $$SRCDIR/blst_aliases.c \
+                -arch=$$ARCH -O2 --expt-relaxed-constexpr -Xcompiler -fPIC \
+                -DFEATURE_BLS12_381 \
+                -I$$SRCDIR/vendor/sppark -I$$SRCDIR/vendor/blst \
+                -L/workspace/blst -lblst \
+                -lcudart -lstdc++ -lpthread
+            # 3) Copy CUDA runtime
+            cp $$CUDA_PATH/lib64/libcudart_static.a $(location libcudart_copy.a)
+        else
+            echo 'int gpu_crypto_init(){return -1;}int gpu_batch_bls_verify(const void*a,const void*b,const void*c,const void*d,int*e,int f){return -1;}int gpu_batch_sha256(const void*a,void*b,int c,int d){return -1;}' > /tmp/stub_$$$$.c
+            echo 'int gpu_msm_g1(const void*a,const void*b,long c,void*d){return -1;}int gpu_jacobian_to_affine(const void*a,void*b){return -1;}int gpu_g1_decompress_batch(const void*a,void*b,int c){return -1;}int gpu_g1_decompress(const void*a,void*b){return -1;}' >> /tmp/stub_$$$$.c
+            gcc -c /tmp/stub_$$$$.c -o /tmp/stub_$$$$.o
+            ar rcs $(location libgpu_crypto_cuda.a) /tmp/stub_$$$$.o
+            ar rcs $(location libcudart_copy.a)
+            gcc -shared -o $(location libgpu_msm.so) /tmp/stub_$$$$.c -fPIC
+        fi
+    """,
+)
+
+# Static library for BLS verify + SHA256
+cc_import(
+    name = "gpu_cuda_static",
+    static_library = ":libgpu_crypto_cuda.a",
+    alwayslink = True,
+)
+
+cc_import(
+    name = "cudart_static",
+    static_library = ":libcudart_copy.a",
+    alwayslink = True,
+)
+
+cc_library(
+    name = "gpu_crypto_cc",
+    deps = [
+        ":gpu_cuda_static",
+        ":cudart_static",
+    ],
+    linkopts = ["-ldl", "-lrt", "-lpthread"],
+)
+
+# Rust library
+rust_library(
+    name = "gpu_crypto",
+    srcs = ["lib.rs"],
+    crate_name = "gpu_crypto",
+    deps = [
+        ":gpu_crypto_cc",
+        "@crate_index//:ic_bls12_381",
+        "@crate_index//:libc",
+        "@crate_index//:pairing",
+    ],
+)

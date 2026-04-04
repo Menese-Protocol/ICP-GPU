@@ -1,0 +1,15 @@
+[package]
+name = "ic-gpu-bench"
+version = "0.1.0"
+edition = "2021"
+description = "IC consensus verification benchmark: GPU vs CPU"
+
+[dependencies]
+gpu-crypto = { path = "../gpu-crypto" }
+ic_bls12_381 = { version = "0.10", default-features = false, features = ["groups", "pairings", "alloc", "experimental"] }
+group = "0.13"
+pairing = "0.23"
+ff = "0.13"
+sha2 = "0.10"
+rand = "0.9"
+rand_core = "0.6"

@@ -1,0 +1,17 @@
+[package]
+name = "gpu-crypto"
+version = "0.1.0"
+edition = "2021"
+description = "GPU-accelerated BLS12-381 crypto for IC consensus"
+
+[dependencies]
+ic_bls12_381 = { version = "0.10", default-features = false, features = ["groups", "pairings", "alloc"] }
+group = "0.13"
+pairing = "0.23"
+
+[build-dependencies]
+cc = { version = "1.0", features = ["parallel"] }
+
+[dev-dependencies]
+ff = "0.13"
+sha2 = "0.10"
